@@ -44,6 +44,10 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+# esptool 5.x emits ANSI colour codes only to a TTY. Force them off — we capture
+# its output into the GUI log, and a --windowed frozen build has no real stdout.
+os.environ.setdefault("NO_COLOR", "1")
+
 # ----------------------------------------------------------------------------
 # Theme palette (Tokyo-Night-ish). All styling is plain ttk — no extra deps.
 # ----------------------------------------------------------------------------
@@ -59,7 +63,12 @@ GREEN   = "#9ece6a"
 RED     = "#f7768e"
 YELLOW  = "#e0af68"
 
-SCRIPT_DIR  = Path(__file__).resolve().parent          # .../Code/bin
+# When frozen by PyInstaller, __file__ lives in a temp unpack dir; anchor to the
+# executable instead so esp_flasher_config.json sits next to the app and persists.
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = Path(sys.executable).resolve().parent
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "esp_flasher_config.json"
 BUILD_ROOT  = Path(os.environ.get("TEMP", "/tmp")) / "esp_flasher_build"
 
@@ -79,7 +88,14 @@ def default_config():
     """Auto-detected defaults. Known boards are only added if their sketch
     folder exists on this machine; everyone else starts empty and uses the
     app's '+ Add Board' button (no code edits needed)."""
-    github_dir = SCRIPT_DIR.parent            # repo usually sits in .../GitHub
+    # Walk up from the app to find the folder holding the sibling Arduino repos
+    # so known boards can be pre-filled. Works whether we run from src/, from a
+    # frozen exe, or anywhere else; harmless if nothing matches (the user just
+    # adds boards from the UI).
+    github_dir = next(
+        (d for d in (SCRIPT_DIR, *SCRIPT_DIR.parents)
+         if (d / "Wireless_Communication_Board-WCB").is_dir()),
+        SCRIPT_DIR.parent)
     wcb_bin    = github_dir / "Wireless_Communication_Board-WCB" / "Code" / "bin"
     s3_boot    = wcb_bin / "WCB_S3_custom_bootloader_16MB_wdt3s.bin"
     ide_cfg    = Path.home() / ".arduinoIDE" / "arduino-cli.yaml"
@@ -157,8 +173,9 @@ def find_arduino_cli():
     return None
 
 
-def esptool_cmd(*args):
-    return [sys.executable, "-m", "esptool", *args]
+# NOTE: esptool runs IN-PROCESS via CompanionApp.run_esptool (further below),
+# not as "python -m esptool". A frozen build has no python.exe to spawn, and
+# sys.executable there is this app itself.
 
 
 # ----------------------------------------------------------------------------
@@ -729,6 +746,67 @@ class CompanionApp(tk.Tk):
         self.proc = None
         return rc, "\n".join(out)
 
+    def run_esptool(self, *args):
+        """Run esptool IN-PROCESS (esptool.main) and stream its output to the
+        log, returning (rc, captured_text) exactly like run_cmd. In-process so a
+        frozen build works with no Python interpreter to run 'python -m esptool'.
+        Note: the STOP button can't interrupt this (only the arduino-cli compile,
+        which stays a real subprocess)."""
+        import esptool
+        argv = [str(a) for a in args]
+        self.log_line("$ esptool " + " ".join(argv), "hdr")
+        captured = []
+        log_line = self.log_line
+
+        class _Pump:
+            """Forward esptool's stdout/stderr to the GUI log. Deliberately has
+            no isatty(), so esptool treats output as non-interactive (no ANSI)."""
+            def __init__(self):
+                self._buf = ""
+
+            def write(self, s):
+                captured.append(s)
+                self._buf += s
+                while "\n" in self._buf:
+                    line, self._buf = self._buf.split("\n", 1)
+                    line = line.split("\r")[-1]   # collapse \r progress redraws
+                    if line:
+                        log_line(line)
+                return len(s)
+
+            def flush(self):
+                tail = self._buf.split("\r")[-1]
+                if tail:
+                    log_line(tail)
+                self._buf = ""
+
+        # Belt-and-suspenders: force esptool's logger to plain (no ANSI) in case
+        # it initialised against a colour-capable TTY.
+        try:
+            from esptool.logger import log as _eslog
+            _eslog._smart_features = False
+            for _a in ("ansi_red", "ansi_yellow", "ansi_blue", "ansi_normal",
+                       "ansi_clear", "ansi_line_up", "ansi_line_clear"):
+                setattr(_eslog, _a, "")
+        except Exception:
+            pass
+
+        pump = _Pump()
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = pump
+        try:
+            esptool.main(argv)
+            rc = 0
+        except SystemExit as e:
+            rc = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+        except Exception as e:                # FatalError / SerialException / OSError
+            rc = 1
+            log_line(str(e) or e.__class__.__name__, "err")
+        finally:
+            pump.flush()
+            sys.stdout, sys.stderr = old_out, old_err
+        return rc, "".join(captured)
+
     def need_port(self, t):
         port = ""
         combo = self.port_combos.get(t["name"])
@@ -783,12 +861,12 @@ class CompanionApp(tk.Tk):
     def task_identify(self, t):
         port = self.need_port(t)
         self.log_line("== Identify board on %s ==" % port, "hdr")
-        self.run_cmd(esptool_cmd("-p", port, "flash_id"))
+        self.run_esptool("-p", port, "flash_id")
 
     def _guard_board(self, t, port):
         """flash_id + verify chip family and real flash size. Raises on mismatch."""
         self.log_line("== Guard: identifying board on %s ==" % port, "hdr")
-        rc, out = self.run_cmd(esptool_cmd("-p", port, "flash_id"))
+        rc, out = self.run_esptool("-p", port, "flash_id")
         if rc != 0:
             raise RuntimeError("Could not identify board (esptool rc=%d). "
                                "Close any serial monitor and retry." % rc)
@@ -813,8 +891,8 @@ class CompanionApp(tk.Tk):
             raise RuntimeError("Bootloader bin not found: %s" % boot)
         self._guard_board(t, port)
         self.log_line("== Flashing custom bootloader at 0x0 (app/NVS untouched) ==", "hdr")
-        rc, _ = self.run_cmd(esptool_cmd("--chip", t["chip"], "-p", port,
-                                         "write_flash", "0x0", str(boot)))
+        rc, _ = self.run_esptool("--chip", t["chip"], "-p", port,
+                                 "write_flash", "0x0", str(boot))
         if rc == 0:
             self.log_line("[DONE] Custom bootloader restored. Reboot the board "
                           "and confirm a saved setting persists.", "ok")
@@ -863,8 +941,8 @@ class CompanionApp(tk.Tk):
 
         self.log_line("== Flashing app at %s on %s (bootloader/NVS untouched) =="
                       % (t["app_addr"], port), "hdr")
-        rc, _ = self.run_cmd(esptool_cmd("--chip", t["chip"], "-p", port,
-                                         "write_flash", t["app_addr"], str(appbin)))
+        rc, _ = self.run_esptool("--chip", t["chip"], "-p", port,
+                                 "write_flash", t["app_addr"], str(appbin))
         if rc == 0:
             self.log_line("[DONE] Built and flashed. Custom bootloader and "
                           "saved config are intact.", "ok")
@@ -874,5 +952,31 @@ class CompanionApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        # Headless check (used by the build scripts / CI) that a frozen bundle
+        # carries esptool + its flasher stubs and pyserial, AND that esptool can
+        # actually run in-process with its streams redirected — the path the GUI
+        # uses, and the one that matters in a --windowed build where the real
+        # sys.stdout is None. Result is conveyed purely via the exit code.
+        try:
+            import io
+            import esptool
+            from esptool.loader import StubFlasher
+            import serial.tools.list_ports  # noqa: F401  (verify pyserial bundled)
+            stubs_ok = any(
+                os.path.isfile(os.path.join(StubFlasher.STUB_DIR, sub, "esp32s3.json"))
+                for sub in StubFlasher.STUB_SUBDIRS
+            )
+            buf = io.StringIO()
+            old_out, old_err = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = buf
+            try:
+                esptool.main(["version"])
+            finally:
+                sys.stdout, sys.stderr = old_out, old_err
+            run_ok = "esptool" in buf.getvalue().lower()
+            sys.exit(0 if (stubs_ok and run_ok) else 3)
+        except Exception:
+            sys.exit(4)
     app = CompanionApp()
     app.mainloop()

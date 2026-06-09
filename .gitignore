@@ -3,3 +3,8 @@ esp_flasher_config.json
 
 __pycache__/
 *.pyc
+
+# PyInstaller build output
+/build/
+/dist/
+/*.spec

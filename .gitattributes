@@ -1,0 +1,12 @@
+# Shell scripts must stay LF or they break on macOS/Linux ("bad interpreter:
+# /bin/bash^M"), even when committed from Windows.
+*.command  text eol=lf
+*.sh       text eol=lf
+
+# Windows batch files want CRLF.
+*.bat      text eol=crlf
+
+# Python: normalize to LF.
+*.py       text eol=lf
+
+*.png      binary
