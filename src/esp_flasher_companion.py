@@ -103,19 +103,27 @@ def default_config():
          if (d / "Wireless_Communication_Board-WCB").is_dir()),
         SCRIPT_DIR.parent)
     wcb_bin    = github_dir / "Wireless_Communication_Board-WCB" / "Code" / "bin"
-    s3_boot    = wcb_bin / "WCB_S3_custom_bootloader_16MB_wdt3s.bin"
+    s3_boot16  = wcb_bin / "WCB_S3_custom_bootloader_16MB_wdt3s.bin"
+    s3_boot8   = wcb_bin / "WCB_S3_custom_bootloader_8MB_wdt3s.bin"
     ide_cfg    = Path.home() / ".arduinoIDE" / "arduino-cli.yaml"
 
     def s3_target(name, sketch, fqbn):
+        # Both custom bootloaders keyed by flash size. Restore Bootloader reads
+        # the connected board's real size and auto-picks the matching one, so a
+        # single card serves both the 8MB (3.1) and 16MB (3.2) S3 dev kits.
+        bls = {}
+        if s3_boot8.is_file():
+            bls["8MB"] = str(s3_boot8)
+        if s3_boot16.is_file():
+            bls["16MB"] = str(s3_boot16)
         return {
             "name":        name,
             "sketch":      str(sketch),
             "fqbn":        fqbn,
             "chip":        "esp32s3",
             "app_addr":    "0x10000",
-            "bootloader":  str(s3_boot) if s3_boot.is_file() else "",
+            "bootloaders": bls,
             "expect_chip": "ESP32-S3",
-            "expect_size": "16MB",
             "ports":       [],
         }
 
@@ -143,9 +151,10 @@ def default_config():
             "  makes library resolution IDENTICAL to the IDE (sketchbook etc).",
             "  Set to null to use arduino-cli defaults instead.",
             "Per target: sketch = folder containing the .ino;  fqbn = board +",
-            "  options exactly as the IDE's Tools menu uses;  bootloader/expect_*",
-            "  drive the guarded 'Restore Bootloader' button (expect_size must",
-            "  match the board's real flash size or it refuses to flash);",
+            "  options exactly as the IDE's Tools menu uses;  bootloaders is a",
+            "  {flash-size: path} map and Restore Bootloader auto-detects the",
+            "  board's real flash size and flashes the matching one (refusing if",
+            "  there is no bootloader for that size);",
             "  ports = the COM ports for this board — each gets its own row of",
             "  Build+Flash / Restore Bootloader / Identify buttons in the app.",
             "Delete this file to regenerate fresh defaults.",
@@ -994,38 +1003,59 @@ class CompanionApp(tk.Tk):
         self.log_line("== Identify on %s ==" % port, "hdr", source=src)
         self.run_cmd(esptool_cmd("-p", port, "flash_id"), source=src)
 
-    def _guard_board(self, t, port, src):
-        """flash_id + verify chip family and real flash size. Raises on mismatch."""
-        self.log_line("== Guard: identifying %s ==" % port, "hdr", source=src)
+    def _bootloaders_map(self, t):
+        """flash-size -> custom-bootloader path for this board. Supports the new
+        per-size 'bootloaders' dict and the legacy single 'bootloader' +
+        'expect_size' pair."""
+        bl = t.get("bootloaders")
+        if isinstance(bl, dict):
+            return {k: v for k, v in bl.items() if v}
+        if t.get("bootloader") and t.get("expect_size"):
+            return {t["expect_size"]: t["bootloader"]}
+        return {}
+
+    def _detect_board(self, t, port, src):
+        """flash_id -> verify chip family, return the detected flash size string.
+        Raises on read failure or a chip-family mismatch."""
+        self.log_line("== Identifying %s ==" % port, "hdr", source=src)
         rc, out = self.run_cmd(esptool_cmd("-p", port, "flash_id"), source=src)
         if rc != 0:
             raise RuntimeError("Could not identify %s (esptool rc=%d). Close any "
                                "serial monitor and retry." % (port, rc))
-        if t["expect_chip"] not in out:
-            raise RuntimeError("ABORT %s: board is not %s — flashing this "
-                               "bootloader would brick it." % (port, t["expect_chip"]))
+        if t.get("expect_chip") and t["expect_chip"] not in out:
+            raise RuntimeError("ABORT %s: board is not %s." % (port, t["expect_chip"]))
         m = re.search(r"Detected flash size:\s*(\S+)", out)
-        size = m.group(1) if m else "?"
-        if size != t["expect_size"]:
-            raise RuntimeError("ABORT %s: detected flash size %s, bootloader needs "
-                               "%s — a mismatch silently corrupts NVS."
-                               % (port, size, t["expect_size"]))
-        self.log_line("[OK] %s / %s — matches bootloader."
-                      % (t["expect_chip"], size), "ok", source=src)
+        if not m:
+            raise RuntimeError("ABORT %s: could not read the flash size." % port)
+        return m.group(1)
 
     def _do_bootloader(self, t, port):
         src = "%s@%s" % (t["name"], port)
-        boot = Path(t["bootloader"])
+        blmap = self._bootloaders_map(t)
+        if not blmap:
+            raise RuntimeError("No custom bootloader configured for %s." % t["name"])
+        # Auto-pick the bootloader whose declared flash size matches the connected
+        # board, so one card safely serves both the 8MB and 16MB WCB dev kits.
+        size = self._detect_board(t, port, src)
+        boot = blmap.get(size)
+        if not boot:
+            raise RuntimeError("ABORT %s: detected %s flash, but no custom bootloader "
+                               "is configured for that size (have: %s). Flashing a "
+                               "wrong-size bootloader silently corrupts NVS."
+                               % (port, size, ", ".join(sorted(blmap)) or "none"))
+        boot = Path(boot)
         if not boot.is_file():
             raise RuntimeError("Bootloader bin not found: %s" % boot)
-        self._guard_board(t, port, src)
-        self.log_line("== Flashing custom bootloader at 0x0 (app/NVS untouched) ==",
-                      "hdr", source=src)
+        self.log_line("[OK] %s / %s flash — using %s"
+                      % (t.get("expect_chip", "board"), size, boot.name),
+                      "ok", source=src)
+        self.log_line("== Flashing %s custom bootloader at 0x0 (app/NVS untouched) =="
+                      % size, "hdr", source=src)
         rc, _ = self.run_cmd(esptool_cmd("--chip", t["chip"], "-p", port,
                                          "write_flash", "0x0", str(boot)), source=src)
         if rc == 0:
-            self.log_line("[DONE] Bootloader restored on %s — reboot and confirm a "
-                          "saved setting persists." % port, "ok", source=src)
+            self.log_line("[DONE] %s bootloader restored on %s — reboot and confirm "
+                          "a saved setting persists." % (size, port), "ok", source=src)
         else:
             raise RuntimeError("Bootloader flash failed on %s (rc=%d)." % (port, rc))
 
