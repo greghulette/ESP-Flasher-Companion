@@ -38,26 +38,28 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --clean --onefile --windowed
           --name ESP-Flasher-Companion
+          --distpath . --workpath build --specpath build
           --collect-all esptool --collect-all serial
           src/esp_flasher_companion.py
 
       - name: Self-test (Windows)
         if: runner.os == 'Windows'
-        run: dist\ESP-Flasher-Companion.exe --selftest
+        run: .\ESP-Flasher-Companion.exe --selftest
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: >
           python -m PyInstaller --noconfirm --clean --windowed
           --name "ESP Flasher Companion"
+          --distpath . --workpath build --specpath build
           --collect-all esptool --collect-all serial
           src/esp_flasher_companion.py
 
       - name: Self-test + zip .app (macOS)
         if: runner.os == 'macOS'
         run: |
-          "dist/ESP Flasher Companion.app/Contents/MacOS/ESP Flasher Companion" --selftest
-          ditto -c -k --keepParent "dist/ESP Flasher Companion.app" "dist/ESP-Flasher-Companion-macos.zip"
+          "ESP Flasher Companion.app/Contents/MacOS/ESP Flasher Companion" --selftest
+          ditto -c -k --keepParent "ESP Flasher Companion.app" "ESP-Flasher-Companion-macos.zip"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -65,8 +67,8 @@ jobs:
           name: ${{ matrix.artifact }}
           if-no-files-found: ignore
           path: |
-            dist/ESP-Flasher-Companion.exe
-            dist/ESP-Flasher-Companion-macos.zip
+            ESP-Flasher-Companion.exe
+            ESP-Flasher-Companion-macos.zip
 
   release:
     needs: build

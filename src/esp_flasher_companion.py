@@ -70,7 +70,13 @@ if getattr(sys, "frozen", False):
 else:
     SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "esp_flasher_config.json"
+LOG_DIR     = SCRIPT_DIR / "logs"
 BUILD_ROOT  = Path(os.environ.get("TEMP", "/tmp")) / "esp_flasher_build"
+
+# Colours cycled per concurrent output source (Board@PORT) so interleaved
+# build/flash streams stay visually distinct in the log.
+SOURCE_PALETTE = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff",
+                  "#f7768e", "#73daca", "#ff9e64", "#c0caf5", "#b4f9f8"]
 
 # Claude usage — rough cost estimate. EDIT to current pricing if you care
 # about the $ column; token counts are exact either way.
@@ -110,7 +116,7 @@ def default_config():
             "bootloader":  str(s3_boot) if s3_boot.is_file() else "",
             "expect_chip": "ESP32-S3",
             "expect_size": "16MB",
-            "port":        "",
+            "ports":       [],
         }
 
     candidates = [
@@ -140,7 +146,8 @@ def default_config():
             "  options exactly as the IDE's Tools menu uses;  bootloader/expect_*",
             "  drive the guarded 'Restore Bootloader' button (expect_size must",
             "  match the board's real flash size or it refuses to flash);",
-            "  port = this board's serial port, remembered per board.",
+            "  ports = the COM ports for this board — each gets its own row of",
+            "  Build+Flash / Restore Bootloader / Identify buttons in the app.",
             "Delete this file to regenerate fresh defaults.",
         ],
         "arduino_cli_config_file": str(ide_cfg) if ide_cfg.is_file() else None,
@@ -173,9 +180,15 @@ def find_arduino_cli():
     return None
 
 
-# NOTE: esptool runs IN-PROCESS via CompanionApp.run_esptool (further below),
-# not as "python -m esptool". A frozen build has no python.exe to spawn, and
-# sys.executable there is this app itself.
+def esptool_cmd(*args):
+    """Build an argv that runs esptool as a SEPARATE PROCESS, so several flashes
+    can run concurrently (each with its own stdout) and STOP can kill them. A
+    frozen build can't spawn 'python -m esptool' (sys.executable is this app, not
+    Python), so it re-runs ITSELF with a hidden --run-esptool flag that hands off
+    to esptool.main() — see the __main__ block at the bottom."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--run-esptool", *[str(a) for a in args]]
+    return [sys.executable, "-m", "esptool", *[str(a) for a in args]]
 
 
 # ----------------------------------------------------------------------------
@@ -261,10 +274,33 @@ class CompanionApp(tk.Tk):
         self._setup_style()
 
         self.log_q = queue.Queue()
-        self.proc = None
-        self.worker = None
-        self.action_buttons = []      # (button, idle_state)
         self.config_data, cfg_note = load_config()
+        self._migrate_ports()
+
+        # Concurrency: several build/flash jobs may run at once, each esptool
+        # call in its own subprocess so they don't collide and STOP can kill them.
+        self._procs = set()              # live subprocesses (for STOP)
+        self._procs_lock = threading.Lock()
+        self._jobs_lock = threading.Lock()
+        self._active = 0                 # running jobs (drives STOP enabled state)
+        self._busy_ports = set()         # ports with an action in flight
+        self._row_combos = {}            # target name -> [port comboboxes]
+        self._port_row_frames = {}       # target name -> rows container frame
+        self._detected_ports = []        # current serial ports (full label strings)
+        self._build_cache = {}           # target name -> (sketch_sig, appbin path)
+        self._build_locks = {}           # target name -> compile lock
+        self._src_colors = {}            # source label -> Text tag name
+
+        # Per-session timestamped log file mirroring everything shown in the log.
+        self._logf = None
+        self._logfile_path = None
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self._logfile_path = LOG_DIR / ("esp_flasher_%s.log"
+                                            % datetime.now().strftime("%Y%m%d-%H%M%S"))
+            self._logf = open(self._logfile_path, "a", encoding="utf-8")
+        except Exception:
+            pass
 
         # Header bar
         head = ttk.Frame(self, style="Head.TFrame", padding=(14, 10))
@@ -285,6 +321,15 @@ class CompanionApp(tk.Tk):
         self.after(80, self._drain_log)
         self.refresh_ports()
         self._startup_checks(cfg_note)
+
+    def _migrate_ports(self):
+        """Normalise every target to a 'ports' list (legacy configs had a single
+        'port' string). Each port becomes its own button row in the UI."""
+        for t in self.config_data.get("targets", []):
+            if not isinstance(t.get("ports"), list):
+                p = (t.get("port") or "").strip()
+                t["ports"] = [p] if p else []
+            t.pop("port", None)
 
     def _mono_family(self):
         from tkinter import font as tkfont
@@ -378,6 +423,10 @@ class CompanionApp(tk.Tk):
         self.stop_btn = ttk.Button(top, text="◼ STOP", style="Danger.TButton",
                                    command=self.stop_task, state="disabled")
         self.stop_btn.pack(side="right")
+        ttk.Button(top, text="📂 Open Logs",
+                   command=self.open_logs).pack(side="right", padx=(2, 8))
+        ttk.Button(top, text="📋 Copy Output",
+                   command=self.copy_output).pack(side="right", padx=2)
 
         self.boards_frame = ttk.Frame(self.flash_tab, padding=(8, 0))
         self.boards_frame.pack(fill="x")
@@ -396,13 +445,15 @@ class CompanionApp(tk.Tk):
         self.log.tag_configure("err", foreground=RED)
         self.log.tag_configure("ok", foreground=GREEN)
         self.log.tag_configure("hdr", foreground=ACCENT)
+        self.log.tag_configure("ts", foreground=SUB)
 
     def _build_board_cards(self):
         for w in self.boards_frame.winfo_children():
             w.destroy()
-        self.action_buttons = []
-        self.port_combos = {}        # target name -> per-board port combobox
+        self._row_combos = {}
+        self._port_row_frames = {}
         for t in self.config_data.get("targets", []):
+            self._build_locks.setdefault(t["name"], threading.Lock())
             self._board_card(self.boards_frame, t)
         self.refresh_ports()
 
@@ -424,29 +475,21 @@ class CompanionApp(tk.Tk):
         path_text = ("not found:  %s" % t["sketch"]) if missing else t["sketch"]
         ttk.Label(r1, text=path_text, style=path_style).pack(side="right", padx=10)
 
-        # Row 2 — per-board port (remembered in config) + actions
-        r2 = ttk.Frame(f, style="Card.TFrame")
-        r2.pack(fill="x", pady=(8, 0))
-        ttk.Label(r2, text="Port", style="CardPath.TLabel").pack(side="left")
-        combo = ttk.Combobox(r2, width=30, state="readonly")
-        combo.pack(side="left", padx=(6, 14))
-        if t.get("port"):
-            combo.set(t["port"])
-        combo.bind("<<ComboboxSelected>>",
-                   lambda e, t=t, c=combo: self._save_port(t, c.get()))
-        self.port_combos[t["name"]] = combo
+        # Port rows — one per assigned COM port, each with its own action buttons.
+        rows = ttk.Frame(f, style="Card.TFrame")
+        rows.pack(fill="x", pady=(6, 0))
+        self._port_row_frames[t["name"]] = rows
+        self._row_combos[t["name"]] = []
+        for port in self._target_ports(t):
+            self._port_row(t, port)
 
-        b1 = ttk.Button(r2, text="⚡ Build + Flash", style="Accent.TButton",
-                        command=lambda t=t: self.run_task(self.task_build_flash, t))
-        b2 = ttk.Button(r2, text="Restore Bootloader",
-                        command=lambda t=t: self.run_task(self.task_bootloader, t))
-        b3 = ttk.Button(r2, text="Identify",
-                        command=lambda t=t: self.run_task(self.task_identify, t))
-        b1_state = "disabled" if missing else "normal"
-        b1.config(state=b1_state)
-        for b, idle in ((b1, b1_state), (b2, "normal"), (b3, "normal")):
-            b.pack(side="left", padx=4)
-            self.action_buttons.append((b, idle))
+        addbar = ttk.Frame(f, style="Card.TFrame")
+        addbar.pack(fill="x", pady=(4, 0))
+        ttk.Button(addbar, text="➕ Add port",
+                   command=lambda t=t: self._add_port_row(t)).pack(side="left")
+        if missing:
+            ttk.Label(addbar, text="(sketch folder missing — Build disabled)",
+                      style="CardErr.TLabel").pack(side="left", padx=10)
 
     def _browse_sketch(self, t):
         start = t["sketch"] if Path(t["sketch"]).is_dir() else str(Path.home())
@@ -585,7 +628,7 @@ class CompanionApp(tk.Tk):
                 "bootloader":  str(SCRIPT_DIR / "WCB_S3_custom_bootloader_16MB_wdt3s.bin") if s3 else "",
                 "expect_chip": "ESP32-S3" if s3 else "ESP32",
                 "expect_size": "16MB" if s3 else "",
-                "port":        "",
+                "ports":       [],
             })
             self._write_config()
             self._build_board_cards()
@@ -598,11 +641,120 @@ class CompanionApp(tk.Tk):
         ttk.Button(btns, text="Add Board", style="Accent.TButton",
                    command=on_ok).pack(side="right")
 
-    def _save_port(self, t, value):
-        port = value.split(" ", 1)[0].strip()
-        t["port"] = port
+    def _target_ports(self, t):
+        return [p for p in (t.get("ports") or []) if p]
+
+    def _display_for(self, device):
+        """Full 'COMx  description' label for a saved bare device, if connected."""
+        for s in self._detected_ports:
+            if s.split(" ", 1)[0].strip() == device:
+                return s
+        return device
+
+    def _port_row(self, t, port):
+        """One COM-port row: port picker + its own action buttons + remove."""
+        rows = self._port_row_frames.get(t["name"])
+        if rows is None:
+            return
+        missing = not Path(t["sketch"]).is_dir()
+        row = ttk.Frame(rows, style="Card.TFrame")
+        row.pack(fill="x", pady=2)
+
+        combo = ttk.Combobox(row, width=26, state="readonly",
+                             values=self._detected_ports)
+        if port:
+            combo.set(self._display_for(port))
+        combo.pack(side="left", padx=(0, 8))
+        combo.bind("<<ComboboxSelected>>", lambda e, t=t: self._sync_ports(t))
+        self._row_combos.setdefault(t["name"], []).append(combo)
+        get_port = lambda c=combo: c.get().split(" ", 1)[0].strip()
+
+        b1 = ttk.Button(row, text="⚡ Build + Flash", style="Accent.TButton")
+        b2 = ttk.Button(row, text="Restore Bootloader")
+        b3 = ttk.Button(row, text="Identify")
+        btns = [b1, b2, b3]
+        b1.config(state=("disabled" if missing else "normal"),
+                  command=lambda t=t, g=get_port, bs=btns:
+                      self._on_port_action(t, g, bs, self._do_build_flash))
+        b2.config(command=lambda t=t, g=get_port, bs=btns:
+                      self._on_port_action(t, g, bs, self._do_bootloader))
+        b3.config(command=lambda t=t, g=get_port, bs=btns:
+                      self._on_port_action(t, g, bs, self._do_identify))
+        ttk.Button(row, text="✕", width=3, style="Danger.TButton",
+                   command=lambda t=t, r=row, c=combo:
+                       self._remove_port_row(t, r, c)).pack(side="right", padx=(6, 0))
+        for b in (b1, b2, b3):
+            b.pack(side="left", padx=3)
+
+    def _add_port_row(self, t):
+        self._port_row(t, "")
+
+    def _remove_port_row(self, t, row, combo):
+        try:
+            self._row_combos.get(t["name"], []).remove(combo)
+        except ValueError:
+            pass
+        row.destroy()
+        self._sync_ports(t)
+
+    def _sync_ports(self, t):
+        """Persist the COM ports currently chosen across this card's rows."""
+        sel = []
+        for c in self._row_combos.get(t["name"], []):
+            try:
+                v = c.get().split(" ", 1)[0].strip()
+            except tk.TclError:
+                v = ""
+            if v and v not in sel:
+                sel.append(v)
+        t["ports"] = sel
         self._write_config()
-        self.log_line("[OK] %s -> %s (remembered)" % (t["name"], port), "ok")
+
+    def _on_port_action(self, t, get_port, buttons, do_fn):
+        """Launch do_fn(t, port) for this row's port as a concurrent job. Guards
+        against double-acting on a busy port and disables the row while it runs."""
+        port = get_port()
+        if not port:
+            self.log_line("[!] Pick a COM port for this row first.", "err",
+                          source=t["name"])
+            return
+        with self._jobs_lock:
+            if port in self._busy_ports:
+                self.log_line("[!] %s is already busy — wait for it to finish."
+                              % port, "err", source="%s@%s" % (t["name"], port))
+                return
+            self._busy_ports.add(port)
+        prev = [(b, b.cget("state")) for b in buttons]
+        for b in buttons:
+            b.config(state="disabled")
+
+        def job():
+            try:
+                do_fn(t, port)
+            finally:
+                with self._jobs_lock:
+                    self._busy_ports.discard(port)
+                self.after(0, lambda: [self._safe_state(b, s) for b, s in prev])
+        self._start_job(job)
+
+    def copy_output(self):
+        txt = self.log.get("1.0", "end-1c")
+        self.clipboard_clear()
+        self.clipboard_append(txt)
+        self.log_line("[OK] Output copied to clipboard (%d chars)." % len(txt), "ok")
+
+    def open_logs(self):
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(str(LOG_DIR))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(LOG_DIR)])
+            else:
+                subprocess.Popen(["xdg-open", str(LOG_DIR)])
+            self.log_line("Logs folder: %s" % LOG_DIR, "hdr")
+        except Exception as e:
+            self.log_line("[X] Couldn't open logs folder: %s" % e, "err")
 
     def edit_config(self):
         if not CONFIG_PATH.is_file():
@@ -686,151 +838,129 @@ class CompanionApp(tk.Tk):
         self.usage_status.config(
             text="Done — %d day/model rows. Today is highlighted." % len(agg))
 
-    # ---------------- logging / task plumbing ----------------
-    def log_line(self, text, tag=None):
-        self.log_q.put((text, tag))
+    # ---------------- logging / concurrency plumbing ----------------
+    def log_line(self, text, tag=None, source=None):
+        self.log_q.put((text, tag, source))
+
+    def _source_tag(self, source):
+        """A stable Text tag (cycled colour) per output source label."""
+        tn = self._src_colors.get(source)
+        if tn is None:
+            color = SOURCE_PALETTE[len(self._src_colors) % len(SOURCE_PALETTE)]
+            tn = "src%d" % len(self._src_colors)
+            self.log.tag_configure(tn, foreground=color)
+            self._src_colors[source] = tn
+        return tn
 
     def _drain_log(self):
         try:
             while True:
-                text, tag = self.log_q.get_nowait()
+                text, tag, source = self.log_q.get_nowait()
+                now = datetime.now()
                 self.log.configure(state="normal")
+                if source:
+                    self.log.insert("end", "[%s  %s]  " % (now.strftime("%H:%M:%S"),
+                                    source), (self._source_tag(source),))
+                else:
+                    self.log.insert("end", "[%s]  " % now.strftime("%H:%M:%S"), ("ts",))
                 self.log.insert("end", text + "\n", tag or ())
                 self.log.see("end")
                 self.log.configure(state="disabled")
+                if self._logf is not None:
+                    try:
+                        label = ("[%s] " % source) if source else ""
+                        self._logf.write("%s  %s%s\n"
+                                         % (now.strftime("%Y-%m-%d %H:%M:%S"),
+                                            label, text))
+                        self._logf.flush()
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
         self.after(80, self._drain_log)
 
-    def set_busy(self, busy):
-        for b, idle in self.action_buttons:
-            b.config(state="disabled" if busy else idle)
-        self.stop_btn.config(state="normal" if busy else "disabled")
+    def _safe_state(self, widget, state):
+        try:
+            widget.config(state=state)
+        except tk.TclError:
+            pass
 
-    def run_task(self, fn, target):
-        if self.worker and self.worker.is_alive():
-            self.log_line("[!] A task is already running.", "err")
-            return
-        self.set_busy(True)
+    def _update_running_state(self):
+        self._safe_state(self.stop_btn, "normal" if self._active > 0 else "disabled")
+
+    def _start_job(self, fn):
+        """Run fn() on a daemon thread, counting it so STOP stays enabled while
+        any job is in flight. Several jobs can run at once."""
+        with self._jobs_lock:
+            self._active += 1
+        self.after(0, self._update_running_state)
 
         def wrapped():
             try:
-                fn(target)
+                fn()
             except Exception as e:
                 self.log_line("[X] %s" % e, "err")
             finally:
-                self.after(0, lambda: self.set_busy(False))
-        self.worker = threading.Thread(target=wrapped, daemon=True)
-        self.worker.start()
+                with self._jobs_lock:
+                    self._active -= 1
+                self.after(0, self._update_running_state)
+        threading.Thread(target=wrapped, daemon=True).start()
 
     def stop_task(self):
-        p = self.proc
-        if p and p.poll() is None:
-            p.terminate()
-            self.log_line("[!] Task stopped by user.", "err")
+        with self._procs_lock:
+            procs = list(self._procs)
+        if not procs:
+            self.log_line("[!] Nothing is running.", "err")
+            return
+        n = 0
+        for p in procs:
+            try:
+                if p.poll() is None:
+                    p.terminate()
+                    n += 1
+            except Exception:
+                pass
+        self.log_line("[!] STOP — terminated %d running task(s)." % n, "err")
 
-    def run_cmd(self, cmd, capture=False):
-        """Stream a subprocess into the log. Returns (rc, captured_text)."""
-        self.log_line("$ " + " ".join(str(c) for c in cmd), "hdr")
+    def run_cmd(self, cmd, source=None):
+        """Stream a subprocess into the log (tagged with `source`). Returns
+        (rc, captured_text). Registered so STOP can terminate it."""
+        self.log_line("$ " + " ".join(str(c) for c in cmd), "hdr", source=source)
         out = []
-        self.proc = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        for line in self.proc.stdout:
-            line = line.rstrip("\r\n")
-            out.append(line)
-            self.log_line(line)
-        self.proc.wait()
-        rc = self.proc.returncode
-        self.proc = None
-        return rc, "\n".join(out)
-
-    def run_esptool(self, *args):
-        """Run esptool IN-PROCESS (esptool.main) and stream its output to the
-        log, returning (rc, captured_text) exactly like run_cmd. In-process so a
-        frozen build works with no Python interpreter to run 'python -m esptool'.
-        Note: the STOP button can't interrupt this (only the arduino-cli compile,
-        which stays a real subprocess)."""
-        import esptool
-        argv = [str(a) for a in args]
-        self.log_line("$ esptool " + " ".join(argv), "hdr")
-        captured = []
-        log_line = self.log_line
-
-        class _Pump:
-            """Forward esptool's stdout/stderr to the GUI log. Deliberately has
-            no isatty(), so esptool treats output as non-interactive (no ANSI)."""
-            def __init__(self):
-                self._buf = ""
-
-            def write(self, s):
-                captured.append(s)
-                self._buf += s
-                while "\n" in self._buf:
-                    line, self._buf = self._buf.split("\n", 1)
-                    line = line.split("\r")[-1]   # collapse \r progress redraws
-                    if line:
-                        log_line(line)
-                return len(s)
-
-            def flush(self):
-                tail = self._buf.split("\r")[-1]
-                if tail:
-                    log_line(tail)
-                self._buf = ""
-
-        # Belt-and-suspenders: force esptool's logger to plain (no ANSI) in case
-        # it initialised against a colour-capable TTY.
+        with self._procs_lock:
+            self._procs.add(proc)
         try:
-            from esptool.logger import log as _eslog
-            _eslog._smart_features = False
-            for _a in ("ansi_red", "ansi_yellow", "ansi_blue", "ansi_normal",
-                       "ansi_clear", "ansi_line_up", "ansi_line_clear"):
-                setattr(_eslog, _a, "")
-        except Exception:
-            pass
-
-        pump = _Pump()
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = sys.stderr = pump
-        try:
-            esptool.main(argv)
-            rc = 0
-        except SystemExit as e:
-            rc = e.code if isinstance(e.code, int) else (1 if e.code else 0)
-        except Exception as e:                # FatalError / SerialException / OSError
-            rc = 1
-            log_line(str(e) or e.__class__.__name__, "err")
+            for line in proc.stdout:
+                line = line.rstrip("\r\n")
+                out.append(line)
+                self.log_line(line, source=source)
+            proc.wait()
         finally:
-            pump.flush()
-            sys.stdout, sys.stderr = old_out, old_err
-        return rc, "".join(captured)
-
-    def need_port(self, t):
-        port = ""
-        combo = self.port_combos.get(t["name"])
-        if combo is not None:
-            port = combo.get().split(" ", 1)[0].strip()
-        if not port:
-            port = (t.get("port") or "").strip()
-        if not port:
-            raise RuntimeError("No port set for '%s' — pick one on its card "
-                               "(it will be remembered)." % t["name"])
-        return port
+            with self._procs_lock:
+                self._procs.discard(proc)
+        return proc.returncode, "\n".join(out)
 
     def refresh_ports(self):
         try:
             import serial.tools.list_ports as lp
-            ports = ["%s  %s" % (p.device, p.description or "") for p in lp.comports()]
+            self._detected_ports = ["%s  %s" % (p.device, p.description or "")
+                                    for p in lp.comports()]
         except Exception as e:
-            ports = []
+            self._detected_ports = []
             self.log_line("[X] pyserial missing? %s" % e, "err")
-        for combo in self.port_combos.values():
-            current = combo.get()
-            combo["values"] = ports
-            if current:                 # keep the remembered choice selected
-                combo.set(current)
+        for combos in self._row_combos.values():
+            for c in combos:
+                try:
+                    current = c.get()
+                    c["values"] = self._detected_ports
+                    if current:          # keep this row's chosen port selected
+                        c.set(current)
+                except tk.TclError:
+                    pass
 
     def _startup_checks(self, cfg_note):
         self.log_line("ESP Flasher Companion ready.", "ok")
@@ -857,58 +987,90 @@ class CompanionApp(tk.Tk):
                           "its own defaults (sketchbook may differ from the IDE).",
                           "err")
 
-    # ---------------- the actual tasks ----------------
-    def task_identify(self, t):
-        port = self.need_port(t)
-        self.log_line("== Identify board on %s ==" % port, "hdr")
-        self.run_esptool("-p", port, "flash_id")
+    # ---------------- the actual work (per port) ----------------
+    def _do_identify(self, t, port):
+        src = "%s@%s" % (t["name"], port)
+        self.log_line("== Identify on %s ==" % port, "hdr", source=src)
+        self.run_cmd(esptool_cmd("-p", port, "flash_id"), source=src)
 
-    def _guard_board(self, t, port):
+    def _guard_board(self, t, port, src):
         """flash_id + verify chip family and real flash size. Raises on mismatch."""
-        self.log_line("== Guard: identifying board on %s ==" % port, "hdr")
-        rc, out = self.run_esptool("-p", port, "flash_id")
+        self.log_line("== Guard: identifying %s ==" % port, "hdr", source=src)
+        rc, out = self.run_cmd(esptool_cmd("-p", port, "flash_id"), source=src)
         if rc != 0:
-            raise RuntimeError("Could not identify board (esptool rc=%d). "
-                               "Close any serial monitor and retry." % rc)
+            raise RuntimeError("Could not identify %s (esptool rc=%d). Close any "
+                               "serial monitor and retry." % (port, rc))
         if t["expect_chip"] not in out:
-            raise RuntimeError(
-                "ABORT: board is not %s. Flashing this bootloader onto a "
-                "different chip would brick it." % t["expect_chip"])
+            raise RuntimeError("ABORT %s: board is not %s — flashing this "
+                               "bootloader would brick it." % (port, t["expect_chip"]))
         m = re.search(r"Detected flash size:\s*(\S+)", out)
         size = m.group(1) if m else "?"
         if size != t["expect_size"]:
-            raise RuntimeError(
-                "ABORT: detected flash size %s, bootloader needs %s. "
-                "A size mismatch silently corrupts NVS (settings won't "
-                "persist)." % (size, t["expect_size"]))
+            raise RuntimeError("ABORT %s: detected flash size %s, bootloader needs "
+                               "%s — a mismatch silently corrupts NVS."
+                               % (port, size, t["expect_size"]))
         self.log_line("[OK] %s / %s — matches bootloader."
-                      % (t["expect_chip"], size), "ok")
+                      % (t["expect_chip"], size), "ok", source=src)
 
-    def task_bootloader(self, t):
-        port = self.need_port(t)
+    def _do_bootloader(self, t, port):
+        src = "%s@%s" % (t["name"], port)
         boot = Path(t["bootloader"])
         if not boot.is_file():
             raise RuntimeError("Bootloader bin not found: %s" % boot)
-        self._guard_board(t, port)
-        self.log_line("== Flashing custom bootloader at 0x0 (app/NVS untouched) ==", "hdr")
-        rc, _ = self.run_esptool("--chip", t["chip"], "-p", port,
-                                 "write_flash", "0x0", str(boot))
+        self._guard_board(t, port, src)
+        self.log_line("== Flashing custom bootloader at 0x0 (app/NVS untouched) ==",
+                      "hdr", source=src)
+        rc, _ = self.run_cmd(esptool_cmd("--chip", t["chip"], "-p", port,
+                                         "write_flash", "0x0", str(boot)), source=src)
         if rc == 0:
-            self.log_line("[DONE] Custom bootloader restored. Reboot the board "
-                          "and confirm a saved setting persists.", "ok")
+            self.log_line("[DONE] Bootloader restored on %s — reboot and confirm a "
+                          "saved setting persists." % port, "ok", source=src)
         else:
-            raise RuntimeError("Bootloader flash failed (rc=%d)." % rc)
+            raise RuntimeError("Bootloader flash failed on %s (rc=%d)." % (port, rc))
 
-    def task_build_flash(self, t):
-        port = self.need_port(t)
+    def _do_build_flash(self, t, port):
+        appbin = self._ensure_built(t)
+        self._flash_app(t, port, appbin)
+
+    def _sketch_sig(self, t):
+        """Signature that changes when the sketch sources change, so a cached
+        build is reused across ports but rebuilt after an edit."""
+        p = Path(t["sketch"])
+        mt = 0.0
+        if p.is_dir():
+            for f in p.rglob("*"):
+                if f.suffix.lower() in (".ino", ".h", ".hpp", ".c", ".cpp", ".cc"):
+                    try:
+                        mt = max(mt, f.stat().st_mtime)
+                    except OSError:
+                        pass
+        return (str(p), t["fqbn"], round(mt, 3))
+
+    def _ensure_built(self, t):
+        """Compile once per card; reuse the binary for further ports unless the
+        sketch changed. Serialised per card so concurrent clicks share one build."""
+        lock = self._build_locks.setdefault(t["name"], threading.Lock())
+        with lock:
+            sig = self._sketch_sig(t)
+            cached = self._build_cache.get(t["name"])
+            if cached and cached[0] == sig and Path(cached[1]).is_file():
+                self.log_line("[OK] Reusing this session's build (sketch unchanged).",
+                              "ok", source=t["name"])
+                return Path(cached[1])
+            appbin = self._compile(t)
+            self._build_cache[t["name"]] = (sig, str(appbin))
+            return appbin
+
+    def _compile(self, t):
         acli = find_arduino_cli()
         if not acli:
             raise RuntimeError("arduino-cli not found.")
+        src = t["name"]
         sketch = Path(t["sketch"])
         build_out = BUILD_ROOT / re.sub(r"\W+", "_", t["name"]).strip("_")
         build_out.mkdir(parents=True, exist_ok=True)
 
-        self.log_line("== Compiling %s (verbose) ==" % sketch.name, "hdr")
+        self.log_line("== Compiling %s (verbose) ==" % sketch.name, "hdr", source=src)
         cmd = [acli]
         ide_cfg = self.config_data.get("arduino_cli_config_file")
         if ide_cfg and Path(ide_cfg).is_file():
@@ -918,63 +1080,65 @@ class CompanionApp(tk.Tk):
         if t.get("libraries"):                   # optional extra libraries root
             cmd += ["--libraries", t["libraries"]]
         cmd.append(str(sketch))
-        rc, out = self.run_cmd(cmd)
+        rc, out = self.run_cmd(cmd, source=src)
         if rc != 0 and "needs to be reinitialized" in out:
             # First use of the IDE's config file: arduino-cli must download the
             # package indexes it references (e.g. extra board URLs) once.
             self.log_line("[!] arduino-cli indexes missing for this config — "
-                          "running one-time update-index, then retrying...", "hdr")
+                          "running one-time update-index, then retrying...", "hdr",
+                          source=src)
             base = [acli]
             if ide_cfg and Path(ide_cfg).is_file():
                 base += ["--config-file", ide_cfg]
-            self.run_cmd(base + ["core", "update-index"])
-            self.run_cmd(base + ["lib", "update-index"])
-            rc, out = self.run_cmd(cmd)
+            self.run_cmd(base + ["core", "update-index"], source=src)
+            self.run_cmd(base + ["lib", "update-index"], source=src)
+            rc, out = self.run_cmd(cmd, source=src)
         if rc != 0:
-            raise RuntimeError("Compile FAILED — nothing flashed.")
-
+            raise RuntimeError("Compile FAILED for %s — nothing flashed." % t["name"])
         bins = sorted(build_out.glob("*.ino.bin"))
         if not bins:
             raise RuntimeError("No .ino.bin produced in %s" % build_out)
-        appbin = bins[0]
-        self.log_line("[OK] Compiled: %s" % appbin, "ok")
+        self.log_line("[OK] Compiled: %s" % bins[0], "ok", source=src)
+        return bins[0]
 
+    def _flash_app(self, t, port, appbin):
+        src = "%s@%s" % (t["name"], port)
         self.log_line("== Flashing app at %s on %s (bootloader/NVS untouched) =="
-                      % (t["app_addr"], port), "hdr")
-        rc, _ = self.run_esptool("--chip", t["chip"], "-p", port,
-                                 "write_flash", t["app_addr"], str(appbin))
+                      % (t["app_addr"], port), "hdr", source=src)
+        rc, _ = self.run_cmd(esptool_cmd("--chip", t["chip"], "-p", port,
+                                         "write_flash", t["app_addr"], str(appbin)),
+                             source=src)
         if rc == 0:
-            self.log_line("[DONE] Built and flashed. Custom bootloader and "
-                          "saved config are intact.", "ok")
+            self.log_line("[DONE] Flashed %s on %s — bootloader and saved config "
+                          "intact." % (appbin.name, port), "ok", source=src)
         else:
-            raise RuntimeError("Flash failed (rc=%d). Hold BOOT, tap RESET, "
-                               "release BOOT, then retry." % rc)
+            raise RuntimeError("Flash failed on %s (rc=%d). Hold BOOT, tap RESET, "
+                               "release BOOT, then retry." % (port, rc))
 
 
 if __name__ == "__main__":
+    # Hidden hand-off: a frozen build re-runs ITSELF as esptool (there is no
+    # python.exe to run 'python -m esptool'). esptool_cmd() emits this in frozen
+    # builds; here we catch it and delegate to esptool.main().
+    if len(sys.argv) >= 2 and sys.argv[1] == "--run-esptool":
+        import esptool
+        sys.exit(esptool.main(sys.argv[2:]))
+
     if "--selftest" in sys.argv:
-        # Headless check (used by the build scripts / CI) that a frozen bundle
-        # carries esptool + its flasher stubs and pyserial, AND that esptool can
-        # actually run in-process with its streams redirected — the path the GUI
-        # uses, and the one that matters in a --windowed build where the real
-        # sys.stdout is None. Result is conveyed purely via the exit code.
+        # Headless check (build scripts / CI) that a frozen bundle carries esptool
+        # + its flasher stubs and pyserial, AND that esptool runs as a subprocess
+        # via the --run-esptool hand-off — the exact path the app uses to flash.
         try:
-            import io
-            import esptool
+            import subprocess as _sp
             from esptool.loader import StubFlasher
             import serial.tools.list_ports  # noqa: F401  (verify pyserial bundled)
             stubs_ok = any(
                 os.path.isfile(os.path.join(StubFlasher.STUB_DIR, sub, "esp32s3.json"))
                 for sub in StubFlasher.STUB_SUBDIRS
             )
-            buf = io.StringIO()
-            old_out, old_err = sys.stdout, sys.stderr
-            sys.stdout = sys.stderr = buf
-            try:
-                esptool.main(["version"])
-            finally:
-                sys.stdout, sys.stderr = old_out, old_err
-            run_ok = "esptool" in buf.getvalue().lower()
+            r = _sp.run(esptool_cmd("version"), capture_output=True, text=True,
+                        creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+            run_ok = r.returncode == 0 and "esptool" in (r.stdout + (r.stderr or "")).lower()
             sys.exit(0 if (stubs_ok and run_ok) else 3)
         except Exception:
             sys.exit(4)

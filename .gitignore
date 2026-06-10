@@ -4,7 +4,14 @@ esp_flasher_config.json
 __pycache__/
 *.pyc
 
-# PyInstaller build output
+# PyInstaller build output — the finished app is emitted to the repo root
+# (build scripts pass --distpath .); only intermediates stay in build/.
 /build/
 /dist/
 /*.spec
+/ESP-Flasher-Companion.exe
+/ESP Flasher Companion.app/
+
+# Runtime logs written by the app (next to the exe when frozen, in src/ when
+# run from source) — match a logs/ folder anywhere.
+logs/

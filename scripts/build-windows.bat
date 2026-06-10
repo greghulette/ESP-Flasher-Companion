@@ -24,20 +24,21 @@ echo [*] Building single-file, windowed executable...
 python -m PyInstaller --noconfirm --clean ^
   --onefile --windowed ^
   --name "ESP-Flasher-Companion" ^
+  --distpath . --workpath build --specpath build ^
   --collect-all esptool ^
   --collect-all serial ^
   src\esp_flasher_companion.py
 if errorlevel 1 ( echo [X] PyInstaller build failed & pause & exit /b 1 )
 
 echo [*] Self-test (verifies esptool + flasher stubs are bundled)...
-start /wait "" "dist\ESP-Flasher-Companion.exe" --selftest
+start /wait "" "ESP-Flasher-Companion.exe" --selftest
 if errorlevel 1 (
   echo [X] Self-test failed ^(exit %errorlevel%^) - the bundle is missing esptool data.
   pause & exit /b 1
 )
 
 echo.
-echo [DONE] dist\ESP-Flasher-Companion.exe
+echo [DONE] ESP-Flasher-Companion.exe  (in the repo root)
 echo        Hand that single file to users - no Python required.
 echo        ^(arduino-cli + the ESP32 core are still needed for the Build button.^)
 pause

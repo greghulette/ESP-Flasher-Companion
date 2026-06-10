@@ -24,11 +24,12 @@ echo "[*] Building windowed .app bundle..."
 "$PY" -m PyInstaller --noconfirm --clean \
   --windowed \
   --name "ESP Flasher Companion" \
+  --distpath . --workpath build --specpath build \
   --collect-all esptool \
   --collect-all serial \
   src/esp_flasher_companion.py
 
-APP="dist/ESP Flasher Companion.app"
+APP="ESP Flasher Companion.app"
 BIN="$APP/Contents/MacOS/ESP Flasher Companion"
 
 echo "[*] Self-test (verifies esptool + flasher stubs are bundled)..."

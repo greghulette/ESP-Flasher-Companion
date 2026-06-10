@@ -12,9 +12,13 @@ even Python.
 
 ## What it does
 
-- **A card per project/board.** Each card has its own remembered serial port —
-  with several boards connected you set each port once and just push buttons,
-  no switching a shared dropdown.
+- **A card per project/board, with one row per COM port.** Add as many ports to a
+  board as you have units plugged in (e.g. four WCBs) — each port gets its own
+  **Build + Flash / Restore Bootloader / Identify** buttons, remembered per board.
+- **Flash several at once.** Clicking buttons on different ports or boards runs
+  them **concurrently** — flash four WCBs together, or a NaviCore and an SBUS
+  board at the same time. Each port flashes in its own process and **STOP**
+  cancels them all. (A board compiles once and reuses that build across its ports.)
 - **⚡ Build + Flash** — compiles the sketch with `arduino-cli` (verbose,
   IDE-style output streaming live) and flashes **only the app** at `0x10000`,
   leaving the bootloader, partition table, and NVS (saved settings) untouched.
@@ -23,8 +27,12 @@ even Python.
   it reads the chip type and the flash chip's real size first and refuses to
   flash on any mismatch — a bootloader built for the wrong flash size silently
   corrupts NVS (settings stop persisting), so the guard makes that impossible.
-- **Identify** — chip type, real flash size, PSRAM, MAC for whatever is on the
-  selected port.
+- **Identify** — chip type, real flash size, PSRAM, MAC for whatever is on that
+  port.
+- **Readable concurrent output.** Every log line is tagged `[time  Board@COM]`
+  and colour-coded per source, so interleaved builds/flashes stay legible. **📋
+  Copy Output** copies the whole log to the clipboard; everything is also mirrored
+  to a timestamped file under `logs/` (**📂 Open Logs** opens the folder).
 - **➕ Add Board / ✕ Remove / 📁 Change…** — manage projects entirely from the
   UI. Adding a board is: pick the sketch folder, tick the USB-CDC / OPI-PSRAM
   boxes if the project needs them, done. Everything persists in a JSON config.
@@ -49,8 +57,10 @@ ESP-Flasher-Companion/
 └── LICENSE
 ```
 
-The per-machine config (`esp_flasher_config.json`) and PyInstaller's `build/`
-and `dist/` output folders are generated at runtime and are gitignored.
+The finished `.exe` / `.app` is built straight into the repo root for easy
+access. The per-machine config (`esp_flasher_config.json`), the runtime
+`logs/`, and PyInstaller's `build/` intermediates are all generated at runtime —
+and everything generated (including the binaries) is gitignored.
 
 ## Getting it
 
@@ -107,17 +117,18 @@ executable that bundles Python + every dependency.
 
 ### How it works
 
-- **esptool runs in-process.** A frozen build has no `python.exe` to spawn, so
-  `python -m esptool` is impossible — instead the app calls `esptool.main()`
-  directly and streams its output into the log. esptool's chip **flasher stubs**
-  are bundled via `--collect-all esptool`.
+- **esptool runs as a subprocess.** Each flash is its own process, so several can
+  run at once and **STOP** can kill them. A frozen build can't spawn
+  `python -m esptool`, so the app re-runs **itself** via a hidden `--run-esptool`
+  flag that hands off to `esptool.main()`. esptool's chip **flasher stubs** are
+  bundled via `--collect-all esptool`.
 - **Config lives next to the executable.** When frozen, the app anchors its
   paths to the executable (not the temp unpack dir), so
   `esp_flasher_config.json` persists between runs. Keep the `.exe`/`.app` in a
   normal folder you can write to (not `C:\Program Files`).
-- **A `--selftest` flag** (used by the build scripts and CI) confirms esptool,
-  its stubs, and pyserial are bundled and that esptool runs in-process — it
-  exits non-zero if anything is missing, so a broken build fails loudly.
+- **A `--selftest` flag** (used by the build scripts and CI) confirms esptool, its
+  stubs, and pyserial are bundled and that the `--run-esptool` subprocess hand-off
+  works — it exits non-zero if anything is missing, so a broken build fails loudly.
 
 ### Build it on your own machine
 
@@ -126,9 +137,9 @@ executable that bundles Python + every dependency.
 > use CI (below) if you only have one OS.
 
 - **Windows:** double-click `scripts\build-windows.bat`
-  → `dist\ESP-Flasher-Companion.exe`
+  → `ESP-Flasher-Companion.exe` (in the repo root)
 - **macOS:** `chmod +x scripts/build-macos.command` once, then double-click
-  → `dist/ESP Flasher Companion.app`
+  → `ESP Flasher Companion.app` (in the repo root)
 
 Each script installs PyInstaller if needed, builds, runs the `--selftest`, and
 tells you where the result is.
