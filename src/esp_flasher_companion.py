@@ -769,6 +769,7 @@ class CompanionApp(tk.Tk):
 
     def reload_config(self):
         self.config_data, note = load_config()
+        self._migrate_ports()
         self._build_board_cards()
         self.log_line(note or "[OK] Config reloaded — %d board(s)."
                       % len(self.config_data.get("targets", [])), "ok")
