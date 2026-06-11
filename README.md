@@ -20,8 +20,10 @@ even Python.
   board at the same time. Each port flashes in its own process and **STOP**
   cancels them all. (A board compiles once and reuses that build across its ports.)
 - **⚡ Build + Flash** — compiles the sketch with `arduino-cli` (verbose,
-  IDE-style output streaming live) and flashes **only the app** at `0x10000`,
-  leaving the bootloader, partition table, and NVS (saved settings) untouched.
+  IDE-style output streaming live), then in **one pass** writes the size-matched
+  custom bootloader at `0x0` **and** the app at `0x10000`, leaving the partition
+  table and NVS (saved settings) untouched. One click leaves the board fully
+  correct. (Boards with no custom bootloader configured just get the app.)
 - **Restore Bootloader** — re-flashes a custom bootloader at `0x0` *after* an
   Arduino IDE upload (the IDE overwrites the bootloader every time). **Guarded**:
   it reads the chip type and the flash chip's real size first and refuses to

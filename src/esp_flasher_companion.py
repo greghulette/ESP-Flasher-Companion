@@ -1060,8 +1060,39 @@ class CompanionApp(tk.Tk):
             raise RuntimeError("Bootloader flash failed on %s (rc=%d)." % (port, rc))
 
     def _do_build_flash(self, t, port):
+        src = "%s@%s" % (t["name"], port)
         appbin = self._ensure_built(t)
-        self._flash_app(t, port, appbin)
+        # One click does it all: restore the size-matched custom bootloader at
+        # 0x0 AND write the app at 0x10000 in a single esptool pass. The
+        # partition table (0x8000) and NVS live at other offsets — untouched.
+        args = ["--chip", t["chip"], "-p", port, "write_flash"]
+        what = "app"
+        blmap = self._bootloaders_map(t)
+        if blmap:
+            size = self._detect_board(t, port, src)   # verifies chip + reads size
+            boot = blmap.get(size)
+            if boot and not Path(boot).is_file():
+                raise RuntimeError("Bootloader bin not found: %s" % boot)
+            if boot:
+                args += ["0x0", str(boot)]
+                what = "%s bootloader + app" % size
+                self.log_line("[OK] %s / %s flash — bootloader %s"
+                              % (t.get("expect_chip", "board"), size,
+                                 Path(boot).name), "ok", source=src)
+            else:
+                self.log_line("[!] No custom bootloader configured for the detected "
+                              "%s flash — writing the app only." % size, "err",
+                              source=src)
+        args += [t["app_addr"], str(appbin)]
+        self.log_line("== Flashing %s on %s (partition table / NVS untouched) =="
+                      % (what, port), "hdr", source=src)
+        rc, _ = self.run_cmd(esptool_cmd(*args), source=src)
+        if rc == 0:
+            self.log_line("[DONE] Flashed %s on %s — saved config intact."
+                          % (what, port), "ok", source=src)
+        else:
+            raise RuntimeError("Flash failed on %s (rc=%d). Hold BOOT, tap RESET, "
+                               "release BOOT, then retry." % (port, rc))
 
     def _sketch_sig(self, t):
         """Signature that changes when the sketch sources change, so a cached
@@ -1131,21 +1162,6 @@ class CompanionApp(tk.Tk):
             raise RuntimeError("No .ino.bin produced in %s" % build_out)
         self.log_line("[OK] Compiled: %s" % bins[0], "ok", source=src)
         return bins[0]
-
-    def _flash_app(self, t, port, appbin):
-        src = "%s@%s" % (t["name"], port)
-        self.log_line("== Flashing app at %s on %s (bootloader/NVS untouched) =="
-                      % (t["app_addr"], port), "hdr", source=src)
-        rc, _ = self.run_cmd(esptool_cmd("--chip", t["chip"], "-p", port,
-                                         "write_flash", t["app_addr"], str(appbin)),
-                             source=src)
-        if rc == 0:
-            self.log_line("[DONE] Flashed %s on %s — bootloader and saved config "
-                          "intact." % (appbin.name, port), "ok", source=src)
-        else:
-            raise RuntimeError("Flash failed on %s (rc=%d). Hold BOOT, tap RESET, "
-                               "release BOOT, then retry." % (port, rc))
-
 
 if __name__ == "__main__":
     # Hidden hand-off: a frozen build re-runs ITSELF as esptool (there is no
