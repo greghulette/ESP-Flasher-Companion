@@ -905,19 +905,41 @@ class CompanionApp(tk.Tk):
     def _do_build_flash(self, t, port):
         src = "%s@%s" % (t["name"], port)
         appbin = self._ensure_built(t)
-        # APP ONLY: writes 0x10000 and never the bootloader at 0x0. The custom
-        # short-WDT bootloader is written deliberately via the Restore Bootloader
-        # button — and only belongs on a board whose firmware already has the
-        # matching boot guard. Writing it under a guard-less app makes cold boots
-        # WORSE, so it must never be automatic.
-        self.log_line("== Flashing app at %s on %s (bootloader / NVS untouched) =="
-                      % (t["app_addr"], port), "hdr", source=src)
-        rc, _ = self.run_cmd(esptool_cmd("--chip", t["chip"], "-p", port,
-                                         "write_flash", t["app_addr"], str(appbin)),
-                             source=src)
+        # ONE CLICK: detect the board's real flash size, write the SIZE-MATCHED
+        # custom bootloader at 0x0 AND the app at 0x10000 in a single esptool
+        # pass (partition table + NVS at other offsets are left untouched).
+        # The size check is the safety net: a bootloader is only written if its
+        # declared size matches the chip — otherwise the app is flashed alone, so
+        # a wrong-size bootloader (the NVS-corruption / no-boot trap) is
+        # impossible. Pair this with the firmware boot guard (all WCB-family apps
+        # have it) so the short-WDT bootloader is always safe to land.
+        args = ["--chip", t["chip"], "-p", port, "write_flash"]
+        what = "app"
+        blmap = self._bootloaders_map(t)
+        if blmap:
+            size = self._detect_board(t, port, src)   # flash_id: verify chip + size
+            boot = blmap.get(size)
+            if boot and not Path(boot).is_file():
+                raise RuntimeError("Bootloader bin not found: %s" % boot)
+            if boot:
+                args += ["0x0", str(boot)]
+                what = "%s bootloader + app" % size
+                self.log_line("[OK] %s / %s — writing matched bootloader %s"
+                              % (t.get("expect_chip", "board"), size,
+                                 Path(boot).name), "ok", source=src)
+            else:
+                self.log_line("[!] Detected %s flash but no custom bootloader is "
+                              "configured for that size (have: %s) — flashing the "
+                              "app only, bootloader left alone."
+                              % (size, ", ".join(sorted(blmap)) or "none"),
+                              "err", source=src)
+        args += [t["app_addr"], str(appbin)]
+        self.log_line("== Flashing %s on %s (partition table / NVS untouched) =="
+                      % (what, port), "hdr", source=src)
+        rc, _ = self.run_cmd(esptool_cmd(*args), source=src)
         if rc == 0:
-            self.log_line("[DONE] Flashed app on %s — bootloader and saved config "
-                          "intact." % port, "ok", source=src)
+            self.log_line("[DONE] Flashed %s on %s — saved config intact."
+                          % (what, port), "ok", source=src)
         else:
             raise RuntimeError("Flash failed on %s (rc=%d). Hold BOOT, tap RESET, "
                                "release BOOT, then retry." % (port, rc))
