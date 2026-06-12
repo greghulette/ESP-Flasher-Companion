@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ============================================================
- ESP Flasher Companion — build/flash control panel + Claude usage
+ ESP Flasher Companion — build / flash control panel
 ============================================================
 One window, no file-explorer hunting:
 
@@ -15,8 +15,6 @@ One window, no file-explorer hunting:
                          Run after any Arduino IDE upload (the IDE wipes
                          the custom bootloader at 0x0 every time).
        Identify        — show chip type / flash size / MAC.
-  • Claude Usage tab — token usage parsed from your local Claude Code
-    session logs (~/.claude/projects/**/*.jsonl), today + last 7 days.
 
 LIBRARIES MATCH THE ARDUINO IDE: compiles run with the IDE's own
 arduino-cli config file (~/.arduinoIDE/arduino-cli.yaml), so the
@@ -38,7 +36,7 @@ import re
 import subprocess
 import sys
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
@@ -78,14 +76,6 @@ BUILD_ROOT  = Path(os.environ.get("TEMP", "/tmp")) / "esp_flasher_build"
 SOURCE_PALETTE = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff",
                   "#f7768e", "#73daca", "#ff9e64", "#c0caf5", "#b4f9f8"]
 
-# Claude usage — rough cost estimate. EDIT to current pricing if you care
-# about the $ column; token counts are exact either way.
-# (input $/MTok, output $/MTok); cache read = 10% of input, cache write = 125%.
-PRICING = {
-    "opus":   (5.0, 25.0),
-    "sonnet": (3.0, 15.0),
-    "haiku":  (1.0, 5.0),
-}
 
 # ----------------------------------------------------------------------------
 # Config — auto-generated on first run, then user-editable JSON.
@@ -201,82 +191,12 @@ def esptool_cmd(*args):
 
 
 # ----------------------------------------------------------------------------
-# Claude usage scanning (reads ~/.claude/projects/**/*.jsonl)
-# ----------------------------------------------------------------------------
-def scan_claude_usage(days=7):
-    """Aggregate token usage per (date, model). Dedupes streamed updates by
-    (message.id, requestId) keeping the LAST seen usage for that pair."""
-    root = Path.home() / ".claude" / "projects"
-    if not root.is_dir():
-        return None, "No Claude Code logs found at %s" % root
-
-    cutoff_dt = datetime.now() - timedelta(days=days)
-    cutoff_mtime = (cutoff_dt - timedelta(days=1)).timestamp()  # mtime pre-filter
-    entries = {}   # (msg_id, req_id) -> (date_str, model, usage)
-    anon = 0
-
-    for f in root.rglob("*.jsonl"):
-        try:
-            if f.stat().st_mtime < cutoff_mtime:
-                continue
-            with open(f, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if '"usage"' not in line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    msg = obj.get("message") or {}
-                    usage = msg.get("usage")
-                    model = msg.get("model") or ""
-                    ts = obj.get("timestamp")
-                    if not usage or not ts or model in ("", "<synthetic>"):
-                        continue
-                    try:
-                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-                    except Exception:
-                        continue
-                    if dt < cutoff_dt.astimezone():
-                        continue
-                    mid, rid = msg.get("id"), obj.get("requestId")
-                    if mid:
-                        key = (mid, rid)
-                    else:
-                        anon += 1
-                        key = ("anon", anon)
-                    entries[key] = (dt.strftime("%Y-%m-%d"), model, usage)
-        except OSError:
-            continue
-
-    agg = {}  # (date, model) -> dict of token sums
-    for date_str, model, u in entries.values():
-        k = (date_str, model)
-        a = agg.setdefault(k, {"in": 0, "out": 0, "cr": 0, "cw": 0, "n": 0})
-        a["in"] += u.get("input_tokens", 0) or 0
-        a["out"] += u.get("output_tokens", 0) or 0
-        a["cr"] += u.get("cache_read_input_tokens", 0) or 0
-        a["cw"] += u.get("cache_creation_input_tokens", 0) or 0
-        a["n"] += 1
-    return agg, None
-
-
-def estimate_cost(model, a):
-    m = model.lower()
-    for fam, (pin, pout) in PRICING.items():
-        if fam in m:
-            return (a["in"] * pin + a["out"] * pout
-                    + a["cr"] * pin * 0.10 + a["cw"] * pin * 1.25) / 1_000_000
-    return None
-
-
-# ----------------------------------------------------------------------------
 # GUI app
 # ----------------------------------------------------------------------------
 class CompanionApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("ESP Flasher Companion — Build / Flash / Usage")
+        self.title("ESP Flasher Companion — Build / Flash")
         self.geometry("1020x800")
         self.minsize(860, 580)
         self.configure(bg=BG)
@@ -318,15 +238,9 @@ class CompanionApp(tk.Tk):
         ttk.Label(head, text="   build · flash · monitor",
                   style="Sub.TLabel").pack(side="left", pady=(4, 0))
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.flash_tab = ttk.Frame(nb, style="TFrame")
-        self.usage_tab = ttk.Frame(nb, style="TFrame")
-        nb.add(self.flash_tab, text="   Flash   ")
-        nb.add(self.usage_tab, text="   Claude Usage   ")
-
+        self.flash_tab = ttk.Frame(self, style="TFrame")
+        self.flash_tab.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self._build_flash_tab()
-        self._build_usage_tab()
         self.after(80, self._drain_log)
         self.refresh_ports()
         self._startup_checks(cfg_note)
@@ -403,13 +317,6 @@ class CompanionApp(tk.Tk):
                     padding=(14, 6), font=("Segoe UI", 10))
         s.map("TNotebook.Tab", background=[("selected", CARD)],
               foreground=[("selected", ACCENT)])
-        # Treeview (usage table)
-        s.configure("Treeview", background=CARD, fieldbackground=CARD,
-                    foreground=FG, borderwidth=0, rowheight=24)
-        s.configure("Treeview.Heading", background=BTN, foreground=FG,
-                    borderwidth=0, font=("Segoe UI Semibold", 9))
-        s.map("Treeview.Heading", background=[("active", BTN_HI)])
-        s.map("Treeview", background=[("selected", "#2f3450")])
         # Scrollbars / labelframe
         s.configure("Vertical.TScrollbar", background=BTN, troughcolor=BG,
                     borderwidth=0, arrowcolor=FG)
@@ -783,71 +690,6 @@ class CompanionApp(tk.Tk):
         self.log_line(note or "[OK] Config reloaded — %d board(s)."
                       % len(self.config_data.get("targets", [])), "ok")
 
-    # ---------------- Usage tab ----------------
-    def _build_usage_tab(self):
-        top = ttk.Frame(self.usage_tab, padding=8)
-        top.pack(fill="x")
-        ttk.Button(top, text="Refresh Usage", command=self.refresh_usage).pack(side="left")
-        self.usage_status = ttk.Label(top, text="")
-        self.usage_status.pack(side="left", padx=10)
-
-        cols = ("date", "model", "inp", "out", "cread", "cwrite", "msgs", "cost")
-        heads = ("Date", "Model", "Input", "Output", "Cache read",
-                 "Cache write", "Msgs", "Est. $")
-        self.tree = ttk.Treeview(self.usage_tab, columns=cols, show="headings")
-        for c, h in zip(cols, heads):
-            self.tree.heading(c, text=h)
-            self.tree.column(c, width=110, anchor="e")
-        self.tree.column("date", width=95, anchor="w")
-        self.tree.column("model", width=230, anchor="w")
-        ys = ttk.Scrollbar(self.usage_tab, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=ys.set)
-        ys.pack(side="right", fill="y")
-        self.tree.pack(fill="both", expand=True, padx=8, pady=8)
-        ttk.Label(self.usage_tab, foreground=SUB, text=(
-            "Token counts are exact (from ~/.claude session logs). $ is a rough "
-            "estimate — edit PRICING at the top of this file to tune."
-        )).pack(pady=(0, 8))
-
-    def refresh_usage(self):
-        self.usage_status.config(text="Scanning logs...")
-        self.update_idletasks()
-
-        def work():
-            agg, err = scan_claude_usage(days=7)
-            self.after(0, lambda: self._fill_usage(agg, err))
-        threading.Thread(target=work, daemon=True).start()
-
-    def _fill_usage(self, agg, err):
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        if err:
-            self.usage_status.config(text=err)
-            return
-        today = datetime.now().strftime("%Y-%m-%d")
-        tot = {"in": 0, "out": 0, "cr": 0, "cw": 0, "n": 0}
-        cost_tot = 0.0
-        have_cost = False
-        for (date_str, model), a in sorted(agg.items(), reverse=True):
-            cost = estimate_cost(model, a)
-            if cost is not None:
-                cost_tot += cost
-                have_cost = True
-            tag = "today" if date_str == today else ""
-            self.tree.insert("", "end", tags=(tag,), values=(
-                date_str, model, f"{a['in']:,}", f"{a['out']:,}",
-                f"{a['cr']:,}", f"{a['cw']:,}", a["n"],
-                f"{cost:.2f}" if cost is not None else "-"))
-            for k in tot:
-                tot[k] += a[k]
-        self.tree.insert("", "end", values=(
-            "TOTAL 7d", "", f"{tot['in']:,}", f"{tot['out']:,}",
-            f"{tot['cr']:,}", f"{tot['cw']:,}", tot["n"],
-            f"{cost_tot:.2f}" if have_cost else "-"))
-        self.tree.tag_configure("today", background="#1f3d2b")
-        self.usage_status.config(
-            text="Done — %d day/model rows. Today is highlighted." % len(agg))
-
     # ---------------- logging / concurrency plumbing ----------------
     def log_line(self, text, tag=None, source=None):
         self.log_q.put((text, tag, source))
@@ -1062,34 +904,19 @@ class CompanionApp(tk.Tk):
     def _do_build_flash(self, t, port):
         src = "%s@%s" % (t["name"], port)
         appbin = self._ensure_built(t)
-        # One click does it all: restore the size-matched custom bootloader at
-        # 0x0 AND write the app at 0x10000 in a single esptool pass. The
-        # partition table (0x8000) and NVS live at other offsets — untouched.
-        args = ["--chip", t["chip"], "-p", port, "write_flash"]
-        what = "app"
-        blmap = self._bootloaders_map(t)
-        if blmap:
-            size = self._detect_board(t, port, src)   # verifies chip + reads size
-            boot = blmap.get(size)
-            if boot and not Path(boot).is_file():
-                raise RuntimeError("Bootloader bin not found: %s" % boot)
-            if boot:
-                args += ["0x0", str(boot)]
-                what = "%s bootloader + app" % size
-                self.log_line("[OK] %s / %s flash — bootloader %s"
-                              % (t.get("expect_chip", "board"), size,
-                                 Path(boot).name), "ok", source=src)
-            else:
-                self.log_line("[!] No custom bootloader configured for the detected "
-                              "%s flash — writing the app only." % size, "err",
-                              source=src)
-        args += [t["app_addr"], str(appbin)]
-        self.log_line("== Flashing %s on %s (partition table / NVS untouched) =="
-                      % (what, port), "hdr", source=src)
-        rc, _ = self.run_cmd(esptool_cmd(*args), source=src)
+        # APP ONLY: writes 0x10000 and never the bootloader at 0x0. The custom
+        # short-WDT bootloader is written deliberately via the Restore Bootloader
+        # button — and only belongs on a board whose firmware already has the
+        # matching boot guard. Writing it under a guard-less app makes cold boots
+        # WORSE, so it must never be automatic.
+        self.log_line("== Flashing app at %s on %s (bootloader / NVS untouched) =="
+                      % (t["app_addr"], port), "hdr", source=src)
+        rc, _ = self.run_cmd(esptool_cmd("--chip", t["chip"], "-p", port,
+                                         "write_flash", t["app_addr"], str(appbin)),
+                             source=src)
         if rc == 0:
-            self.log_line("[DONE] Flashed %s on %s — saved config intact."
-                          % (what, port), "ok", source=src)
+            self.log_line("[DONE] Flashed app on %s — bootloader and saved config "
+                          "intact." % port, "ok", source=src)
         else:
             raise RuntimeError("Flash failed on %s (rc=%d). Hold BOOT, tap RESET, "
                                "release BOOT, then retry." % (port, rc))
