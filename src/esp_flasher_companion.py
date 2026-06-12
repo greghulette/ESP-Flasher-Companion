@@ -129,7 +129,8 @@ def default_config():
                   "PartitionScheme=min_spiffs,PSRAM=opi"),
         s3_target("SBUS Controller  (ESP32-S3)",
                   github_dir / "Arduino-Code" / "SBUSController",
-                  "esp32:esp32:esp32s3:PartitionScheme=min_spiffs"),
+                  "esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,"
+                  "PartitionScheme=min_spiffs"),
     ]
     targets = [t for t in candidates if Path(t["sketch"]).is_dir()]
 
