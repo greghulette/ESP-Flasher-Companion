@@ -872,6 +872,24 @@ class CompanionApp(tk.Tk):
             raise RuntimeError("ABORT %s: could not read the flash size." % port)
         return m.group(1)
 
+    def _exit_download_mode(self, t, port, src):
+        """Some S3 boards stay in ROM download mode after esptool's post-flash
+        reset (USB-Serial-JTAG control-line quirk — the app never starts until
+        a physical RESET). Probe WITHOUT resetting: if the ROM bootloader still
+        answers, the board is stuck — issue 'run' to start the app. If the app
+        is already running the probe just fails to sync and we say nothing."""
+        rc, _ = self.run_cmd(esptool_cmd("-p", port, "--before", "no-reset",
+                                         "--after", "no-reset",
+                                         "--connect-attempts", "2", "run"),
+                             source=src)
+        if rc == 0:
+            self.log_line("[!] Board was STILL in download mode after the flash "
+                          "reset — sent RUN to start the app. If the LED stays "
+                          "dark, press the board's RESET button.", "hdr", source=src)
+        else:
+            self.log_line("[OK] Board left download mode (app is running).",
+                          "ok", source=src)
+
     def _do_bootloader(self, t, port):
         src = "%s@%s" % (t["name"], port)
         blmap = self._bootloaders_map(t)
@@ -899,6 +917,7 @@ class CompanionApp(tk.Tk):
         if rc == 0:
             self.log_line("[DONE] %s bootloader restored on %s — reboot and confirm "
                           "a saved setting persists." % (size, port), "ok", source=src)
+            self._exit_download_mode(t, port, src)
         else:
             raise RuntimeError("Bootloader flash failed on %s (rc=%d)." % (port, rc))
 
@@ -940,6 +959,7 @@ class CompanionApp(tk.Tk):
         if rc == 0:
             self.log_line("[DONE] Flashed %s on %s — saved config intact."
                           % (what, port), "ok", source=src)
+            self._exit_download_mode(t, port, src)
         else:
             raise RuntimeError("Flash failed on %s (rc=%d). Hold BOOT, tap RESET, "
                                "release BOOT, then retry." % (port, rc))
