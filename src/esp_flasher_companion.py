@@ -876,16 +876,27 @@ class CompanionApp(tk.Tk):
         """Some S3 boards stay in ROM download mode after esptool's post-flash
         reset (USB-Serial-JTAG control-line quirk — the app never starts until
         a physical RESET). Probe WITHOUT resetting: if the ROM bootloader still
-        answers, the board is stuck — issue 'run' to start the app. If the app
-        is already running the probe just fails to sync and we say nothing."""
-        rc, _ = self.run_cmd(esptool_cmd("-p", port, "--before", "no-reset",
-                                         "--after", "no-reset",
-                                         "--connect-attempts", "2", "run"),
-                             source=src)
+        answers, the board is stuck — reboot it via the RTC WATCHDOG (register-
+        based, no DTR/RTS involved; DTR/RTS is the very mechanism that re-enters
+        download mode). Also call out a port held open by another program — a
+        serial monitor that auto-reconnects can itself re-trigger download mode
+        the instant esptool releases the port."""
+        rc, out = self.run_cmd(esptool_cmd("-p", port, "--before", "no-reset",
+                                           "--after", "watchdog-reset",
+                                           "--connect-attempts", "2", "chip-id"),
+                               source=src)
+        low = out.lower()
         if rc == 0:
             self.log_line("[!] Board was STILL in download mode after the flash "
-                          "reset — sent RUN to start the app. If the LED stays "
-                          "dark, press the board's RESET button.", "hdr", source=src)
+                          "reset — rebooted it via the RTC watchdog. If the LED "
+                          "stays dark, press its RESET button.", "hdr", source=src)
+        elif ("could not open" in low or "access is denied" in low
+              or "permission" in low or "busy" in low):
+            self.log_line("[!] Couldn't verify %s — the port is held open by "
+                          "another program (serial monitor?). An auto-reconnect "
+                          "monitor can ITSELF push the board back into download "
+                          "mode as esptool releases the port. Close it (e.g. the "
+                          "Arduino IDE) and reflash." % port, "err", source=src)
         else:
             self.log_line("[OK] Board left download mode (app is running).",
                           "ok", source=src)
@@ -912,8 +923,11 @@ class CompanionApp(tk.Tk):
                       "ok", source=src)
         self.log_line("== Flashing %s custom bootloader at 0x0 (app/NVS untouched) =="
                       % size, "hdr", source=src)
-        rc, _ = self.run_cmd(esptool_cmd("--chip", t["chip"], "-p", port,
-                                         "write_flash", "0x0", str(boot)), source=src)
+        bl_args = ["--chip", t["chip"], "-p", port]
+        if t["chip"].startswith("esp32s"):
+            bl_args += ["--after", "watchdog-reset"]   # see _do_build_flash note
+        bl_args += ["write_flash", "0x0", str(boot)]
+        rc, _ = self.run_cmd(esptool_cmd(*bl_args), source=src)
         if rc == 0:
             self.log_line("[DONE] %s bootloader restored on %s — reboot and confirm "
                           "a saved setting persists." % (size, port), "ok", source=src)
@@ -932,7 +946,13 @@ class CompanionApp(tk.Tk):
         # a wrong-size bootloader (the NVS-corruption / no-boot trap) is
         # impossible. Pair this with the firmware boot guard (all WCB-family apps
         # have it) so the short-WDT bootloader is always safe to land.
-        args = ["--chip", t["chip"], "-p", port, "write_flash"]
+        args = ["--chip", t["chip"], "-p", port]
+        if t["chip"].startswith("esp32s"):
+            # Native-USB chips: leave the flash via RTC-watchdog reset instead of
+            # the DTR/RTS hard reset — DTR/RTS over USB-Serial-JTAG is what keeps
+            # re-entering download mode on these devkits.
+            args += ["--after", "watchdog-reset"]
+        args += ["write_flash"]
         what = "app"
         blmap = self._bootloaders_map(t)
         if blmap:
