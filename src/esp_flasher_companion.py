@@ -775,10 +775,12 @@ class CompanionApp(tk.Tk):
                 pass
         self.log_line("[!] STOP — terminated %d running task(s)." % n, "err")
 
-    def run_cmd(self, cmd, source=None):
+    def run_cmd(self, cmd, source=None, quiet=False):
         """Stream a subprocess into the log (tagged with `source`). Returns
-        (rc, captured_text). Registered so STOP can terminate it."""
-        self.log_line("$ " + " ".join(str(c) for c in cmd), "hdr", source=source)
+        (rc, captured_text). Registered so STOP can terminate it. quiet=True
+        captures output without logging it (verification probes)."""
+        if not quiet:
+            self.log_line("$ " + " ".join(str(c) for c in cmd), "hdr", source=source)
         out = []
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -790,7 +792,8 @@ class CompanionApp(tk.Tk):
             for line in proc.stdout:
                 line = line.rstrip("\r\n")
                 out.append(line)
-                self.log_line(line, source=source)
+                if not quiet:
+                    self.log_line(line, source=source)
             proc.wait()
         finally:
             with self._procs_lock:
@@ -881,15 +884,22 @@ class CompanionApp(tk.Tk):
         download mode). Also call out a port held open by another program — a
         serial monitor that auto-reconnects can itself re-trigger download mode
         the instant esptool releases the port."""
+        self.log_line("== Verifying the board left download mode ==", "hdr",
+                      source=src)
         rc, out = self.run_cmd(esptool_cmd("-p", port, "--before", "no-reset",
                                            "--after", "watchdog-reset",
                                            "--connect-attempts", "2", "chip-id"),
-                               source=src)
+                               source=src, quiet=True)
         low = out.lower()
         if rc == 0:
             self.log_line("[!] Board was STILL in download mode after the flash "
                           "reset — rebooted it via the RTC watchdog. If the LED "
                           "stays dark, press its RESET button.", "hdr", source=src)
+        elif "failed to connect" in low or "no serial data received" in low:
+            # The GOOD case: nothing answered the bootloader probe -> the chip
+            # is out of download mode and the app is running.
+            self.log_line("[OK] Board is out of download mode — app is running.",
+                          "ok", source=src)
         elif ("could not open" in low or "access is denied" in low
               or "permission" in low or "busy" in low):
             self.log_line("[!] Couldn't verify %s — the port is held open by "
@@ -898,8 +908,9 @@ class CompanionApp(tk.Tk):
                           "mode as esptool releases the port. Close it (e.g. the "
                           "Arduino IDE) and reflash." % port, "err", source=src)
         else:
-            self.log_line("[OK] Board left download mode (app is running).",
-                          "ok", source=src)
+            tail = out.strip().splitlines()[-1] if out.strip() else "(no output)"
+            self.log_line("[!] Boot check inconclusive on %s: %s"
+                          % (port, tail), "err", source=src)
 
     def _do_bootloader(self, t, port):
         src = "%s@%s" % (t["name"], port)
@@ -1059,7 +1070,17 @@ if __name__ == "__main__":
     # builds; here we catch it and delegate to esptool.main().
     if len(sys.argv) >= 2 and sys.argv[1] == "--run-esptool":
         import esptool
-        sys.exit(esptool.main(sys.argv[2:]))
+        try:
+            sys.exit(esptool.main(sys.argv[2:]))
+        except Exception as e:
+            # Programmatic esptool.main() RAISES (FatalError etc.) instead of
+            # exiting — condense to one line; a raw traceback in the flash log
+            # reads like a crash when it's often just "not in bootloader".
+            try:
+                print("esptool error: %s" % e)
+            except Exception:
+                pass
+            sys.exit(2)
 
     if "--selftest" in sys.argv:
         # Headless check (build scripts / CI) that a frozen bundle carries esptool
