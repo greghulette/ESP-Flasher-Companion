@@ -949,14 +949,17 @@ class CompanionApp(tk.Tk):
     def _do_build_flash(self, t, port):
         src = "%s@%s" % (t["name"], port)
         appbin = self._ensure_built(t)
-        # ONE CLICK: detect the board's real flash size, write the SIZE-MATCHED
-        # custom bootloader at 0x0 AND the app at 0x10000 in a single esptool
-        # pass (partition table + NVS at other offsets are left untouched).
-        # The size check is the safety net: a bootloader is only written if its
-        # declared size matches the chip — otherwise the app is flashed alone, so
-        # a wrong-size bootloader (the NVS-corruption / no-boot trap) is
-        # impossible. Pair this with the firmware boot guard (all WCB-family apps
-        # have it) so the short-WDT bootloader is always safe to land.
+        # ONE CLICK, FULL IMAGE: detect flash size, then write — in a single
+        # esptool pass — the size-matched custom bootloader (0x0), the partition
+        # table (0x8000), the OTA-data selector (0xe000) and the app (0x10000).
+        # That's exactly the layout the Arduino IDE writes, with the custom
+        # bootloader swapped in. Writing the PARTITION TABLE is what keeps the
+        # on-flash layout in sync with the app: an app-only flash leaves whatever
+        # table was there before, so changing the partition scheme (e.g. to
+        # min_spiffs) silently mismatches the app vs the map and breaks boot. NVS
+        # (0x9000) lives between the table and the OTA-data and is NOT written
+        # here, so saved settings survive. The size check still guards the
+        # bootloader — it's only written when its declared size matches the chip.
         args = ["--chip", t["chip"], "-p", port]
         if t["chip"].startswith("esp32s"):
             # Native-USB chips: leave the flash via RTC-watchdog reset instead of
@@ -964,7 +967,7 @@ class CompanionApp(tk.Tk):
             # re-entering download mode on these devkits.
             args += ["--after", "watchdog-reset"]
         args += ["write_flash"]
-        what = "app"
+        parts = []
         blmap = self._bootloaders_map(t)
         if blmap:
             size = self._detect_board(t, port, src)   # flash_id: verify chip + size
@@ -973,27 +976,61 @@ class CompanionApp(tk.Tk):
                 raise RuntimeError("Bootloader bin not found: %s" % boot)
             if boot:
                 args += ["0x0", str(boot)]
-                what = "%s bootloader + app" % size
-                self.log_line("[OK] %s / %s — writing matched bootloader %s"
-                              % (t.get("expect_chip", "board"), size,
-                                 Path(boot).name), "ok", source=src)
+                parts.append("%s bootloader" % size)
             else:
                 self.log_line("[!] Detected %s flash but no custom bootloader is "
-                              "configured for that size (have: %s) — flashing the "
-                              "app only, bootloader left alone."
-                              % (size, ", ".join(sorted(blmap)) or "none"),
-                              "err", source=src)
-        args += [t["app_addr"], str(appbin)]
-        self.log_line("== Flashing %s on %s (partition table / NVS untouched) =="
-                      % (what, port), "hdr", source=src)
-        rc, _ = self.run_cmd(esptool_cmd(*args), source=src)
-        if rc == 0:
-            self.log_line("[DONE] Flashed %s on %s — saved config intact."
-                          % (what, port), "ok", source=src)
-            self._exit_download_mode(t, port, src)
+                              "configured for that size (have: %s) — leaving the "
+                              "bootloader alone." % (size, ", ".join(sorted(blmap))
+                                                     or "none"), "err", source=src)
+        ptab = self._partition_table(appbin)
+        if ptab:
+            args += ["0x8000", str(ptab)]
+            parts.append("partition table")
         else:
+            self.log_line("[!] No partition-table .bin next to the app — flashing "
+                          "without it (on-flash layout left as-is).", "err",
+                          source=src)
+        boot_app0 = self._find_boot_app0()
+        if boot_app0:
+            args += ["0xe000", str(boot_app0)]
+            parts.append("OTA-data")
+        args += [t["app_addr"], str(appbin)]
+        parts.append("app")
+        self.log_line("== Flashing %s on %s (NVS / saved settings untouched) =="
+                      % (" + ".join(parts), port), "hdr", source=src)
+        rc, _ = self.run_cmd(esptool_cmd(*args), source=src)
+        if rc != 0:
             raise RuntimeError("Flash failed on %s (rc=%d). Hold BOOT, tap RESET, "
                                "release BOOT, then retry." % (port, rc))
+        self.log_line("[DONE] Flashed %s on %s — full image, layout in sync, saved "
+                      "config intact." % (" + ".join(parts), port), "ok", source=src)
+        self._exit_download_mode(t, port, src)
+
+    def _partition_table(self, appbin):
+        """The partition-table .bin arduino-cli emitted next to the compiled app
+        (defines where app / NVS / SPIFFS / OTA-data live)."""
+        cands = sorted(appbin.parent.glob("*.partitions.bin"))
+        return cands[0] if cands else None
+
+    def _find_boot_app0(self):
+        """Locate the esp32 core's boot_app0.bin — the OTA-data initializer that
+        points the bootloader at the freshly-written app slot. Cached; None if
+        the core layout can't be found (then OTA-data is left as-is)."""
+        if hasattr(self, "_boot_app0_cache"):
+            return self._boot_app0_cache
+        found = None
+        for r in (Path(os.environ.get("LOCALAPPDATA", "")) / "Arduino15",
+                  Path.home() / ".arduino15",
+                  Path.home() / "Library" / "Arduino15"):
+            base = r / "packages" / "esp32" / "hardware" / "esp32"
+            if base.is_dir():
+                cands = sorted(base.glob("*/tools/partitions/boot_app0.bin"),
+                               reverse=True)
+                if cands:
+                    found = str(cands[0])
+                    break
+        self._boot_app0_cache = found
+        return found
 
     def _sketch_sig(self, t):
         """Signature that changes when the sketch sources change, so a cached
