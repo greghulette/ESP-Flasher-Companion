@@ -71,6 +71,18 @@ CONFIG_PATH = SCRIPT_DIR / "esp_flasher_config.json"
 LOG_DIR     = SCRIPT_DIR / "logs"
 BUILD_ROOT  = Path(os.environ.get("TEMP", "/tmp")) / "esp_flasher_build"
 
+
+def resource_path(name):
+    """Locate a bundled READ-ONLY resource (the app icon, etc.).
+
+    PyInstaller unpacks --add-data files into a temp dir exposed as
+    sys._MEIPASS at runtime; in a normal (dev) run they sit next to this
+    source file. This is deliberately separate from SCRIPT_DIR, which points
+    at the executable's own folder (so the user-editable config/logs persist),
+    NOT at the throw-away unpack dir."""
+    base = getattr(sys, "_MEIPASS", None) or Path(__file__).resolve().parent
+    return Path(base) / name
+
 # Colours cycled per concurrent output source (Board@PORT) so interleaved
 # build/flash streams stay visually distinct in the log.
 SOURCE_PALETTE = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff",
@@ -195,9 +207,33 @@ def esptool_cmd(*args):
 # GUI app
 # ----------------------------------------------------------------------------
 class CompanionApp(tk.Tk):
+    def _set_window_icon(self):
+        """Use the WCB (R2) logo for the title bar / taskbar instead of Tk's
+        default feather. On Windows the .ico drives both the title-bar glyph
+        and the taskbar button; iconphoto(PNG) covers macOS/Linux and any
+        toplevel that ignores the .ico. Both are bundled via PyInstaller
+        --add-data and resolved through resource_path(). Best-effort: a missing
+        or unreadable icon must never stop the app from launching."""
+        try:
+            ico = resource_path("WCB.ico")
+            if os.name == "nt" and ico.exists():
+                self.iconbitmap(default=str(ico))
+        except Exception:
+            pass
+        try:
+            png = resource_path("WCB.png")
+            if png.exists():
+                # Keep a reference — Tk does not retain PhotoImage objects, and
+                # a GC'd image silently reverts the icon.
+                self._icon_img = tk.PhotoImage(file=str(png))
+                self.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
+
     def __init__(self):
         super().__init__()
         self.title("ESP Flasher Companion — Build / Flash")
+        self._set_window_icon()
         self.geometry("1020x800")
         self.minsize(860, 580)
         self.configure(bg=BG)

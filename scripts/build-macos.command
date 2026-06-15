@@ -24,7 +24,9 @@ echo "[*] Building windowed .app bundle..."
 "$PY" -m PyInstaller --noconfirm --clean \
   --windowed \
   --name "ESP Flasher Companion" \
-  --distpath . --workpath build --specpath build \
+  --icon src/WCB.icns \
+  --add-data "src/WCB.png:." \
+  --distpath . --workpath build \
   --collect-all esptool \
   --collect-all serial \
   src/esp_flasher_companion.py

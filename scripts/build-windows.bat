@@ -24,7 +24,10 @@ echo [*] Building single-file, windowed executable...
 python -m PyInstaller --noconfirm --clean ^
   --onefile --windowed ^
   --name "ESP-Flasher-Companion" ^
-  --distpath . --workpath build --specpath build ^
+  --icon src\WCB.ico ^
+  --add-data "src\WCB.ico;." ^
+  --add-data "src\WCB.png;." ^
+  --distpath . --workpath build ^
   --collect-all esptool ^
   --collect-all serial ^
   src\esp_flasher_companion.py
