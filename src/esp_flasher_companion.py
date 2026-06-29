@@ -7,8 +7,11 @@ One window, no file-explorer hunting:
 
   • Pick a serial port from a dropdown (refreshable).
   • Per-board buttons (boards defined in esp_flasher_config.json):
-       Build + Flash   — arduino-cli compile (verbose) + app-only flash
-                         at 0x10000 (custom bootloader / NVS untouched)
+       Build + Flash   — arduino-cli compile (verbose) + FULL-image flash in
+                         one esptool pass: size-matched bootloader @0x0,
+                         partition table @0x8000, OTA-data selector @0xe000
+                         (boots the freshly-flashed app), app @0x10000.
+                         NVS (0x9000) untouched, so saved settings survive.
        Restore Bootloader — GUARDED: detects chip + real flash size via
                          esptool flash_id and REFUSES unless it matches
                          the bootloader (prevents the 4MB/16MB NVS trap).
@@ -35,6 +38,7 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -1030,6 +1034,17 @@ class CompanionApp(tk.Tk):
         if boot_app0:
             args += ["0xe000", str(boot_app0)]
             parts.append("OTA-data")
+        else:
+            # boot_app0.bin not found — still MUST reset the OTA-data selector, or a
+            # board a prior OTA (?OTA / ?OTALOCAL) switched to ota_1 keeps booting
+            # ota_1 ("flashed but version didn't change"), or reboot-loops if ota_1
+            # is empty. Erase the sector (0xFF) so the bootloader falls back to
+            # ota_0 = the app we're flashing right now.
+            args += ["0xe000", str(self._blank_otadata())]
+            parts.append("OTA-data(erase)")
+            self.log_line("[i] boot_app0.bin not found — erasing OTA-data (0xe000) "
+                          "so the board boots the freshly-flashed app (ota_0).",
+                          "ok", source=src)
         args += [t["app_addr"], str(appbin)]
         parts.append("app")
         self.log_line("== Flashing %s on %s (NVS / saved settings untouched) =="
@@ -1067,6 +1082,22 @@ class CompanionApp(tk.Tk):
                     break
         self._boot_app0_cache = found
         return found
+
+    def _blank_otadata(self):
+        """Path to an 8 KB 0xFF blob used to ERASE the OTA-data sector (0xe000)
+        when the core's boot_app0.bin can't be found. Writing 0xFF via write_flash
+        leaves the sector erased, so the bootloader defaults to ota_0 — the slot
+        Build + Flash just wrote. Cached in the temp dir."""
+        if hasattr(self, "_blank_otadata_cache"):
+            return self._blank_otadata_cache
+        p = Path(tempfile.gettempdir()) / "wcb_otadata_blank_8k.bin"
+        try:
+            if not p.is_file() or p.stat().st_size != 0x2000:
+                p.write_bytes(b"\xFF" * 0x2000)
+        except OSError as e:
+            raise RuntimeError("Could not create blank OTA-data file: %s" % e)
+        self._blank_otadata_cache = str(p)
+        return self._blank_otadata_cache
 
     def _sketch_sig(self, t):
         """Signature that changes when the sketch sources change, so a cached

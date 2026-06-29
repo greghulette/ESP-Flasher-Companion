@@ -20,13 +20,17 @@ even Python.
   board at the same time. Each port flashes in its own process and **STOP**
   cancels them all. (A board compiles once and reuses that build across its ports.)
 - **⚡ Build + Flash** — compiles the sketch, **detects the board's flash size**,
-  and in one pass writes the **size-matched** custom bootloader at `0x0` *and* the
-  app at `0x10000` (partition table + NVS untouched). One click leaves the board
-  fully correct. The size check means it only ever writes a bootloader that
-  matches the chip — if none is configured for the detected size it flashes the
-  app alone, so a wrong-size bootloader is impossible. (Pairs with the firmware
-  **boot guard** — all WCB-family apps have it.) **Restore Bootloader** is still
-  there to rewrite *only* the bootloader (e.g. right after an Arduino IDE upload).
+  and in one pass writes the full image: the **size-matched** custom bootloader at
+  `0x0`, the **partition table** at `0x8000`, the **OTA-data selector** at `0xe000`,
+  and the app at `0x10000`. The OTA-data write means the board boots the app you
+  just flashed — even if it had previously been updated over the air to the other
+  OTA slot. **NVS (`0x9000`) is left untouched, so saved settings survive.** The
+  size check means it only ever writes a bootloader that matches the chip — if none
+  is configured for the detected size it leaves the bootloader alone (still writing
+  the partition table, OTA-data, and app), so a wrong-size bootloader is impossible.
+  (Pairs with the firmware **boot guard** — all WCB-family apps have it.) **Restore
+  Bootloader** is still there to rewrite *only* the bootloader (e.g. right after an
+  Arduino IDE upload).
 - **Restore Bootloader** — re-flashes a custom bootloader at `0x0` *after* an
   Arduino IDE upload (the IDE overwrites the bootloader every time). **Guarded**:
   it reads the chip type and the flash chip's real size first and refuses to
